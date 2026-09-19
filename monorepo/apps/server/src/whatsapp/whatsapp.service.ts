@@ -473,15 +473,68 @@ export class WhatsAppService {
     return { status: 'processed' };
   }
 
-  private async processConversation(client: Client, text: string, replyId: string) {
-    const stateKey = client.phoneNumber;
-    let state = this.conversationStates.get(stateKey);
+  private async getConversationState(client: Client): Promise<ConversationState | undefined> {
+    const memState = this.conversationStates.get(client.phoneNumber);
+    if (memState) return memState;
 
-    const lower = text.toLowerCase();
+    if (client.notes && client.notes.startsWith('__CONV_STATE__:')) {
+      try {
+        const state = JSON.parse(client.notes.replace('__CONV_STATE__:', ''));
+        this.conversationStates.set(client.phoneNumber, state);
+        return state;
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+
+  private async setConversationState(client: Client, state: ConversationState) {
+    this.conversationStates.set(client.phoneNumber, state);
+    try {
+      await this.clientService.update(client.id, {
+        notes: `__CONV_STATE__:${JSON.stringify(state)}`,
+      });
+    } catch (err: any) {
+      this.logger.warn(`Could not persist conversation state: ${err.message}`);
+    }
+  }
+
+  private async clearConversationState(client: Client) {
+    this.conversationStates.delete(client.phoneNumber);
+    try {
+      await this.clientService.update(client.id, { notes: undefined });
+    } catch (err: any) {
+      this.logger.warn(`Could not clear conversation state: ${err.message}`);
+    }
+  }
+
+  private parseDateString(str: string): string | undefined {
+    const clean = str.trim();
+    if (/^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$/.test(clean)) {
+      const parts = clean.split(/[-/.]/);
+      const y = parts[0];
+      const m = parts[1].padStart(2, '0');
+      const d = parts[2].padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    }
+    if (/^\d{1,2}[-/.]\d{1,2}[-/.]\d{4}$/.test(clean)) {
+      const parts = clean.split(/[-/.]/);
+      const d = parts[0].padStart(2, '0');
+      const m = parts[1].padStart(2, '0');
+      const y = parts[2];
+      return `${y}-${m}-${d}`;
+    }
+    return undefined;
+  }
+
+  private async processConversation(client: Client, text: string, replyId: string) {
+    let state = await this.getConversationState(client);
+    const lower = text.toLowerCase().trim();
 
     // Cancel / reset intent
     if (lower === 'cancel' || lower === 'reset' || replyId === 'btn_cancel') {
-      this.conversationStates.delete(stateKey);
+      await this.clearConversationState(client);
       await this.sendTextMessage(
         client,
         'Booking flow has been cancelled. Whenever you are ready to book an appointment, simply reply with "book".',
@@ -490,7 +543,13 @@ export class WhatsAppService {
     }
 
     // Intent to start booking
-    if (lower.includes('book') || lower.includes('appointment') || lower.includes('schedule') || !state) {
+    if (
+      lower === 'book' ||
+      lower.includes('schedule') ||
+      lower.includes('appointment') ||
+      lower === 'start' ||
+      (!state && (lower.includes('hi') || lower.includes('hello') || lower.includes('namaste') || lower.includes('book')))
+    ) {
       const sessionTypes = await this.sessionTypeService.getAll();
       if (sessionTypes.length === 0) {
         await this.sendTextMessage(
@@ -500,7 +559,7 @@ export class WhatsAppService {
         return;
       }
 
-      this.conversationStates.set(stateKey, { step: 'AWAITING_SESSION' });
+      await this.setConversationState(client, { step: 'AWAITING_SESSION' });
 
       const rows = sessionTypes.map((st) => ({
         id: `st_${st.id}`,
@@ -518,8 +577,24 @@ export class WhatsAppService {
       return;
     }
 
+    if (!state) {
+      await this.sendTextMessage(
+        client,
+        'Namaste! 🙏 Welcome to Astrologer Consultation.\n\nReply with *book* to schedule an appointment.',
+      );
+      return;
+    }
+
     // Step 1: Session selected -> Show open slots (Multi-day smart availability)
-    if (state.step === 'AWAITING_SESSION' && replyId.startsWith('st_')) {
+    if (state.step === 'AWAITING_SESSION') {
+      if (!replyId.startsWith('st_')) {
+        await this.sendTextMessage(
+          client,
+          'Please select a consultation type from the list above 👆 (or reply *cancel* to restart).',
+        );
+        return;
+      }
+
       const sessionTypeId = replyId.replace('st_', '');
       state.sessionTypeId = sessionTypeId;
 
@@ -553,12 +628,12 @@ export class WhatsAppService {
           client,
           `There are currently no open slots in the upcoming week for "${sessionType.name}". Please contact admin or try another session.`,
         );
-        this.conversationStates.delete(stateKey);
+        await this.clearConversationState(client);
         return;
       }
 
       state.step = 'AWAITING_SLOT';
-      this.conversationStates.set(stateKey, state);
+      await this.setConversationState(client, state);
 
       const isToday = targetDateStr === new Date().toISOString().split('T')[0];
       const formattedDate = new Date(`${targetDateStr}T00:00:00Z`).toLocaleDateString('en-US', {
@@ -584,16 +659,24 @@ export class WhatsAppService {
     }
 
     // Step 2: Slot selected -> Start intake stepper (Step 1/3: Name)
-    if (state.step === 'AWAITING_SLOT' && replyId.startsWith('slot_')) {
+    if (state.step === 'AWAITING_SLOT') {
+      if (!replyId.startsWith('slot_')) {
+        await this.sendTextMessage(
+          client,
+          'Please pick a time slot from the list above 👆 (or reply *cancel* to restart).',
+        );
+        return;
+      }
+
       const slotStart = decodeURIComponent(replyId.replace('slot_', ''));
       state.selectedSlot = slotStart;
       state.step = 'INTAKE_NAME';
       state.intakeData = {};
-      this.conversationStates.set(stateKey, state);
+      await this.setConversationState(client, state);
 
       await this.sendTextMessage(
         client,
-        '✨ *Slot Reserved!*\n\nLet\'s collect your consultation details:\n\n1️⃣ *Step 1/3:* What is your *Full Name*?\n_(Tip: You can also send Name, Date of Birth, Address all in one message!)_',
+        '✨ *Slot Reserved!*\n\nLet\'s collect your consultation details:\n\n1️⃣ *Step 1/3:* What is your *Full Name*?\n_(Tip: You can also reply with Name, Date of Birth, Address all in one message!)_',
       );
       return;
     }
@@ -613,8 +696,9 @@ export class WhatsAppService {
 
         for (let i = 1; i < multiParts.length; i++) {
           const item = multiParts[i];
-          if (/^\d{4}-\d{2}-\d{2}$/.test(item) || /^\d{1,2}[-/.]\d{1,2}[-/.]\d{4}$/.test(item)) {
-            foundDob = item;
+          const parsed = this.parseDateString(item);
+          if (parsed) {
+            foundDob = parsed;
           } else {
             addressParts.push(item);
           }
@@ -626,14 +710,14 @@ export class WhatsAppService {
           address: addressParts.join(', ') || state.intakeData?.address || '',
         };
 
-        return this.showBookingSummaryAndConfirm(client, state, stateKey);
+        return this.showBookingSummaryAndConfirm(client, state);
       }
 
       // 3b. Step-by-Step guided stepper
       if (state.step === 'INTAKE_NAME') {
         state.intakeData = { ...state.intakeData, name: text };
         state.step = 'INTAKE_DOB';
-        this.conversationStates.set(stateKey, state);
+        await this.setConversationState(client, state);
 
         await this.sendTextMessage(
           client,
@@ -644,10 +728,11 @@ export class WhatsAppService {
 
       if (state.step === 'INTAKE_DOB') {
         if (text.toLowerCase() !== 'skip') {
-          state.intakeData = { ...state.intakeData, birthDate: text };
+          const parsed = this.parseDateString(text);
+          state.intakeData = { ...state.intakeData, birthDate: parsed || text };
         }
         state.step = 'INTAKE_ADDRESS';
-        this.conversationStates.set(stateKey, state);
+        await this.setConversationState(client, state);
 
         await this.sendTextMessage(
           client,
@@ -660,7 +745,7 @@ export class WhatsAppService {
         if (text.toLowerCase() !== 'skip') {
           state.intakeData = { ...state.intakeData, address: text };
         }
-        return this.showBookingSummaryAndConfirm(client, state, stateKey);
+        return this.showBookingSummaryAndConfirm(client, state);
       }
     }
 
@@ -672,9 +757,9 @@ export class WhatsAppService {
         lower.includes('yes') ||
         lower === 'ok'
       ) {
-        return this.executeConfirmedBooking(client, state, stateKey);
+        return this.executeConfirmedBooking(client, state);
       } else if (replyId === 'btn_cancel' || lower.includes('cancel')) {
-        this.conversationStates.delete(stateKey);
+        await this.clearConversationState(client);
         await this.sendTextMessage(
           client,
           'Booking has been cancelled. Whenever you are ready, reply with "book".',
@@ -693,10 +778,9 @@ export class WhatsAppService {
   private async showBookingSummaryAndConfirm(
     client: Client,
     state: ConversationState,
-    stateKey: string,
   ) {
     state.step = 'AWAITING_CONFIRMATION';
-    this.conversationStates.set(stateKey, state);
+    await this.setConversationState(client, state);
 
     const sessionType = await this.sessionTypeService.getById(state.sessionTypeId!);
 
@@ -741,7 +825,6 @@ export class WhatsAppService {
   private async executeConfirmedBooking(
     client: Client,
     state: ConversationState,
-    stateKey: string,
   ) {
     const name = state.intakeData?.name || client.name || 'Client';
     const birthDate = state.intakeData?.birthDate;
@@ -783,14 +866,14 @@ export class WhatsAppService {
         `🎉 *Booking Confirmed!* 🎉\n\n📌 *Session:* ${sessionType?.name || 'Consultation'}\n📅 *Date:* ${dateStr}\n⏰ *Time:* ${startLocal}\n👤 *Name:* ${name}\n🎂 *DOB:* ${birthDate || 'Not provided'}\n📍 *Address:* ${address || 'Not provided'}\n\nYour appointment is officially booked and locked into our schedule. We look forward to seeing you! 🙏`,
         booking,
       );
-      this.conversationStates.delete(stateKey);
+      await this.clearConversationState(client);
     } catch (err: any) {
       // Slot overlap or constraint error
       await this.sendTextMessage(
         client,
         '⚠️ *Slot Unavailable*: That time slot was just taken by another client. Please reply "book" to pick another available slot.',
       );
-      this.conversationStates.delete(stateKey);
+      await this.clearConversationState(client);
     }
   }
 }
