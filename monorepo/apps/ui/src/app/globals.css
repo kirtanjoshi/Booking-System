@@ -1,0 +1,126 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+@import '@mantine/core/styles.css';
+@import '@mantine/dates/styles.css';
+@import '@mantine/notifications/styles.css';
+
+:root {
+  --bg-canvas: #F4F5F9;
+  --bg-surface: #FFFFFF;
+  --bg-subtle: #F8FAFC;
+  --border-subtle: #E2E8F0;
+  --border-hover: #CBD5E1;
+  --text-main: #0F172A;
+  --text-muted: #64748B;
+  --text-light: #94A3B8;
+  --primary-blue: #2563EB;
+  --primary-blue-hover: #1D4ED8;
+  --accent-emerald: #10B981;
+  --card-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.04), 0 2px 6px -1px rgba(15, 23, 42, 0.02);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background-color: var(--bg-canvas);
+  color: var(--text-main);
+  font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Light SaaS Cards */
+.saas-card {
+  background: #FFFFFF !important;
+  border: 1px solid var(--border-subtle) !important;
+  border-radius: 16px !important;
+  box-shadow: var(--card-shadow) !important;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.saas-card:hover {
+  box-shadow: 0 10px 25px -3px rgba(15, 23, 42, 0.07), 0 4px 10px -2px rgba(15, 23, 42, 0.03) !important;
+  border-color: var(--border-hover) !important;
+}
+
+/* Sidebar & AppShell Layout */
+.mantine-AppShell-root {
+  min-height: 100vh;
+}
+
+@media (max-width: 768px) {
+  .mantine-AppShell-main {
+    padding-left: 16px !important;
+    padding-right: 16px !important;
+  }
+  .mantine-AppShell-header {
+    padding-left: 16px !important;
+    padding-right: 16px !important;
+  }
+}
+
+.saas-sidebar {
+  background: #FFFFFF;
+  border-right: 1px solid var(--border-subtle);
+}
+
+/* Striped Progress Bar (like YowTrip Image 1) */
+.mini-progress-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: #E2E8F0;
+  overflow: hidden;
+  position: relative;
+}
+
+.mini-progress-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2563EB 0%, #3B82F6 100%);
+}
+
+.mini-progress-bar-striped {
+  background: repeating-linear-gradient(
+    45deg,
+    #10B981,
+    #10B981 4px,
+    #34D399 4px,
+    #34D399 8px
+  );
+}
+
+/* Pastel Badge Classes (like EcoJourney & YowTrip) */
+.badge-confirmed {
+  background: #DCFCE7 !important;
+  color: #15803D !important;
+  font-weight: 600;
+}
+
+.badge-pending {
+  background: #FEF9C3 !important;
+  color: #A16207 !important;
+  font-weight: 600;
+}
+
+.badge-cancelled {
+  background: #FEE2E2 !important;
+  color: #B91C1C !important;
+  font-weight: 600;
+}
+
+.badge-completed {
+  background: #EFF6FF !important;
+  color: #1D4ED8 !important;
+  font-weight: 600;
+}
+
+.badge-whatsapp {
+  background: #E0F2FE !important;
+  color: #0369A1 !important;
+  font-weight: 600;
+}
+
+
