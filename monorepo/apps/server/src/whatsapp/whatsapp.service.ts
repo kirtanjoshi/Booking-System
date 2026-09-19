@@ -23,10 +23,21 @@ import {
 import { WhatsAppEmbeddedSignupCallbackDto } from './dto/whatsapp-embedded-signup.dto';
 
 interface ConversationState {
-  step: 'AWAITING_SESSION' | 'AWAITING_SLOT' | 'AWAITING_DETAILS';
+  step:
+    | 'AWAITING_SESSION'
+    | 'AWAITING_SLOT'
+    | 'INTAKE_NAME'
+    | 'INTAKE_DOB'
+    | 'INTAKE_ADDRESS'
+    | 'AWAITING_CONFIRMATION';
   sessionTypeId?: string;
   selectedSlot?: string;
   adminId?: string;
+  intakeData?: {
+    name?: string;
+    birthDate?: string;
+    address?: string;
+  };
 }
 
 @Injectable()
@@ -318,6 +329,54 @@ export class WhatsAppService {
     return whatsappMessageId;
   }
 
+  // 6b. Interactive Button Message (Up to 3 Quick Action Buttons)
+  async sendInteractiveButtons(
+    client: Client,
+    headerText: string | undefined,
+    bodyText: string,
+    buttons: { id: string; title: string }[],
+    footerText?: string,
+  ): Promise<string | undefined> {
+    const payload: any = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: client.phoneNumber.replace('+', ''),
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        body: { text: bodyText },
+        action: {
+          buttons: buttons.map((b) => ({
+            type: 'reply',
+            reply: {
+              id: b.id,
+              title: b.title.substring(0, 20),
+            },
+          })),
+        },
+      },
+    };
+
+    if (headerText) {
+      payload.interactive.header = { type: 'text', text: headerText };
+    }
+    if (footerText) {
+      payload.interactive.footer = { text: footerText };
+    }
+
+    const whatsappMessageId = await this.sendGraphApiMessage(payload);
+
+    await this.messageLogService.logMessage({
+      client,
+      direction: MessageDirection.OUTBOUND,
+      messageType: MessageType.LIST,
+      content: `[Buttons: ${bodyText}]`,
+      whatsappMessageId,
+    });
+
+    return whatsappMessageId;
+  }
+
   // 7. Business-initiated: Cancellation notice (24-hour window aware)
   async sendCancellationNotice(booking: Booking, reason: string) {
     const client = booking.client;
@@ -386,14 +445,17 @@ export class WhatsAppService {
     const client = await this.clientService.findOrCreate({ phoneNumber: fromPhone });
 
     let userText = '';
-    let selectedListId = '';
+    let selectedReplyId = '';
 
     if (message.type === 'text') {
       userText = message.text?.body?.trim() || '';
     } else if (message.type === 'interactive') {
       if (message.interactive?.type === 'list_reply') {
-        selectedListId = message.interactive.list_reply?.id || '';
+        selectedReplyId = message.interactive.list_reply?.id || '';
         userText = message.interactive.list_reply?.title || '';
+      } else if (message.interactive?.type === 'button_reply') {
+        selectedReplyId = message.interactive.button_reply?.id || '';
+        userText = message.interactive.button_reply?.title || '';
       }
     }
 
@@ -406,16 +468,26 @@ export class WhatsAppService {
       whatsappMessageId,
     });
 
-    this.logger.log(`💬 Processing WhatsApp conversation for ${client.phoneNumber} with text: "${userText}" (listId: "${selectedListId}")`);
-    await this.processConversation(client, userText, selectedListId);
+    this.logger.log(`💬 Processing WhatsApp conversation for ${client.phoneNumber} with text: "${userText}" (replyId: "${selectedReplyId}")`);
+    await this.processConversation(client, userText, selectedReplyId);
     return { status: 'processed' };
   }
 
-  private async processConversation(client: Client, text: string, listReplyId: string) {
+  private async processConversation(client: Client, text: string, replyId: string) {
     const stateKey = client.phoneNumber;
     let state = this.conversationStates.get(stateKey);
 
     const lower = text.toLowerCase();
+
+    // Cancel / reset intent
+    if (lower === 'cancel' || lower === 'reset' || replyId === 'btn_cancel') {
+      this.conversationStates.delete(stateKey);
+      await this.sendTextMessage(
+        client,
+        'Booking flow has been cancelled. Whenever you are ready to book an appointment, simply reply with "book".',
+      );
+      return;
+    }
 
     // Intent to start booking
     if (lower.includes('book') || lower.includes('appointment') || lower.includes('schedule') || !state) {
@@ -447,8 +519,8 @@ export class WhatsAppService {
     }
 
     // Step 1: Session selected -> Show open slots (Multi-day smart availability)
-    if (state.step === 'AWAITING_SESSION' && listReplyId.startsWith('st_')) {
-      const sessionTypeId = listReplyId.replace('st_', '');
+    if (state.step === 'AWAITING_SESSION' && replyId.startsWith('st_')) {
+      const sessionTypeId = replyId.replace('st_', '');
       state.sessionTypeId = sessionTypeId;
 
       const sessionType = await this.sessionTypeService.getById(sessionTypeId);
@@ -465,7 +537,6 @@ export class WhatsAppService {
         const checkDate = d.toISOString().split('T')[0];
         const slots = await this.availabilityService.getAvailability(adminId, checkDate, sessionTypeId);
 
-        // Filter out slots that have already passed if checking today
         const validSlots = offset === 0
           ? slots.filter((s) => new Date(s.start).getTime() > Date.now())
           : slots;
@@ -512,75 +583,214 @@ export class WhatsAppService {
       return;
     }
 
-    // Step 2: Slot selected -> Ask Full Name, DOB, Address in 1 single step
-    if (state.step === 'AWAITING_SLOT' && listReplyId.startsWith('slot_')) {
-      const slotStart = decodeURIComponent(listReplyId.replace('slot_', ''));
+    // Step 2: Slot selected -> Start intake stepper (Step 1/3: Name)
+    if (state.step === 'AWAITING_SLOT' && replyId.startsWith('slot_')) {
+      const slotStart = decodeURIComponent(replyId.replace('slot_', ''));
       state.selectedSlot = slotStart;
-      state.step = 'AWAITING_DETAILS';
+      state.step = 'INTAKE_NAME';
+      state.intakeData = {};
       this.conversationStates.set(stateKey, state);
 
       await this.sendTextMessage(
         client,
-        '✨ *Slot Reserved!* To finalize your booking, please reply with your:\n\n*Full Name, Date of Birth (YYYY-MM-DD), and Address*\n(e.g., Kirtan Joshi, 2005-02-16, Kathmandu)',
+        '✨ *Slot Reserved!*\n\nLet\'s collect your consultation details:\n\n1️⃣ *Step 1/3:* What is your *Full Name*?\n_(Tip: You can also send Name, Date of Birth, Address all in one message!)_',
       );
       return;
     }
 
-    // Step 3: Details received -> Update client, create booking transactionally & direct confirm
-    if (state.step === 'AWAITING_DETAILS') {
-      const parts = text.split(/,|\n/);
-      const name = parts[0]?.trim() || client.name || 'Client';
-      const rawDob = parts[1]?.trim();
-      const address = parts.slice(2).join(', ').trim() || '';
+    // Step 3: Stepper Intake Processing (Fast-Track vs Step-by-Step)
+    if (
+      state.step === 'INTAKE_NAME' ||
+      state.step === 'INTAKE_DOB' ||
+      state.step === 'INTAKE_ADDRESS'
+    ) {
+      // 3a. Fast-track parser if user sent multiple comma/newline separated details at once
+      const multiParts = text.split(/,|\n/).map((s) => s.trim()).filter(Boolean);
+      if (multiParts.length >= 2) {
+        const name = multiParts[0];
+        let foundDob: string | undefined;
+        const addressParts: string[] = [];
 
-      const birthDate = rawDob && /^\d{4}-\d{2}-\d{2}$/.test(rawDob) ? rawDob : undefined;
+        for (let i = 1; i < multiParts.length; i++) {
+          const item = multiParts[i];
+          if (/^\d{4}-\d{2}-\d{2}$/.test(item) || /^\d{1,2}[-/.]\d{1,2}[-/.]\d{4}$/.test(item)) {
+            foundDob = item;
+          } else {
+            addressParts.push(item);
+          }
+        }
 
-      // Update client profile
-      await this.clientService.update(client.id, {
-        name,
-        birthDate,
-        birthPlace: address || undefined,
+        state.intakeData = {
+          name: name || state.intakeData?.name || client.name,
+          birthDate: foundDob || state.intakeData?.birthDate,
+          address: addressParts.join(', ') || state.intakeData?.address || '',
+        };
+
+        return this.showBookingSummaryAndConfirm(client, state, stateKey);
+      }
+
+      // 3b. Step-by-Step guided stepper
+      if (state.step === 'INTAKE_NAME') {
+        state.intakeData = { ...state.intakeData, name: text };
+        state.step = 'INTAKE_DOB';
+        this.conversationStates.set(stateKey, state);
+
+        await this.sendTextMessage(
+          client,
+          `Nice to meet you, *${text}*!\n\n2️⃣ *Step 2/3:* What is your *Date of Birth* (YYYY-MM-DD, e.g., 1995-08-15)?\n_(Or reply *skip*)_`,
+        );
+        return;
+      }
+
+      if (state.step === 'INTAKE_DOB') {
+        if (text.toLowerCase() !== 'skip') {
+          state.intakeData = { ...state.intakeData, birthDate: text };
+        }
+        state.step = 'INTAKE_ADDRESS';
+        this.conversationStates.set(stateKey, state);
+
+        await this.sendTextMessage(
+          client,
+          `Got it! 📅\n\n3️⃣ *Step 3/3:* What is your *Current City / Address*?\n_(Or reply *skip*)_`,
+        );
+        return;
+      }
+
+      if (state.step === 'INTAKE_ADDRESS') {
+        if (text.toLowerCase() !== 'skip') {
+          state.intakeData = { ...state.intakeData, address: text };
+        }
+        return this.showBookingSummaryAndConfirm(client, state, stateKey);
+      }
+    }
+
+    // Step 4: Booking Summary Confirmation
+    if (state.step === 'AWAITING_CONFIRMATION') {
+      if (
+        replyId === 'btn_confirm' ||
+        lower.includes('confirm') ||
+        lower.includes('yes') ||
+        lower === 'ok'
+      ) {
+        return this.executeConfirmedBooking(client, state, stateKey);
+      } else if (replyId === 'btn_cancel' || lower.includes('cancel')) {
+        this.conversationStates.delete(stateKey);
+        await this.sendTextMessage(
+          client,
+          'Booking has been cancelled. Whenever you are ready, reply with "book".',
+        );
+        return;
+      } else {
+        await this.sendTextMessage(
+          client,
+          'Please tap *Confirm Booking* below or reply *confirm* to finalize your appointment, or reply *cancel* to restart.',
+        );
+        return;
+      }
+    }
+  }
+
+  private async showBookingSummaryAndConfirm(
+    client: Client,
+    state: ConversationState,
+    stateKey: string,
+  ) {
+    state.step = 'AWAITING_CONFIRMATION';
+    this.conversationStates.set(stateKey, state);
+
+    const sessionType = await this.sessionTypeService.getById(state.sessionTypeId!);
+
+    const dateStr = new Date(state.selectedSlot!).toLocaleDateString('en-US', {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+
+    const startLocal = new Date(state.selectedSlot!).toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+    const name = state.intakeData?.name || client.name || 'Client';
+    const dob = state.intakeData?.birthDate || 'Not provided';
+    const address = state.intakeData?.address || 'Not provided';
+
+    const summaryText =
+      `📋 *Please confirm your consultation details:*\n\n` +
+      `📌 *Session:* ${sessionType?.name || 'Consultation'}\n` +
+      `📅 *Date:* ${dateStr}\n` +
+      `⏰ *Time:* ${startLocal}\n` +
+      `👤 *Name:* ${name}\n` +
+      `🎂 *DOB:* ${dob}\n` +
+      `📍 *Address:* ${address}\n\n` +
+      `Tap *Confirm Booking* below to reserve your slot immediately!`;
+
+    await this.sendInteractiveButtons(
+      client,
+      'Booking Confirmation',
+      summaryText,
+      [
+        { id: 'btn_confirm', title: '✅ Confirm Booking' },
+        { id: 'btn_cancel', title: '❌ Cancel' },
+      ],
+      'Astrologer Booking System',
+    );
+  }
+
+  private async executeConfirmedBooking(
+    client: Client,
+    state: ConversationState,
+    stateKey: string,
+  ) {
+    const name = state.intakeData?.name || client.name || 'Client';
+    const birthDate = state.intakeData?.birthDate;
+    const address = state.intakeData?.address;
+
+    // Update client profile
+    await this.clientService.update(client.id, {
+      name,
+      birthDate: birthDate && /^\d{4}-\d{2}-\d{2}$/.test(birthDate) ? birthDate : undefined,
+      birthPlace: address || undefined,
+    });
+
+    // Call backend POST /bookings transactionally
+    try {
+      const booking = await this.bookingService.createBooking({
+        adminId: state.adminId!,
+        sessionTypeId: state.sessionTypeId!,
+        scheduledStart: state.selectedSlot!,
+        source: BookingSource.WHATSAPP,
+        clientId: client.id,
       });
 
-      // Call backend POST /bookings transactionally
-      try {
-        const booking = await this.bookingService.createBooking({
-          adminId: state.adminId!,
-          sessionTypeId: state.sessionTypeId!,
-          scheduledStart: state.selectedSlot!,
-          source: BookingSource.WHATSAPP,
-          clientId: client.id,
-        });
+      const sessionType = await this.sessionTypeService.getById(state.sessionTypeId!);
 
-        const sessionType = await this.sessionTypeService.getById(state.sessionTypeId!);
+      const dateStr = new Date(booking.scheduledStart).toLocaleDateString('en-US', {
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
 
-        const dateStr = new Date(booking.scheduledStart).toLocaleDateString('en-US', {
-          weekday: 'short',
-          month: 'short',
-          day: 'numeric',
-          year: 'numeric',
-        });
+      const startLocal = new Date(booking.scheduledStart).toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
 
-        const startLocal = new Date(booking.scheduledStart).toLocaleTimeString('en-US', {
-          hour: '2-digit',
-          minute: '2-digit',
-        });
-
-        await this.sendTextMessage(
-          client,
-          `🎉 *Booking Confirmed!* 🎉\n\n📌 *Session:* ${sessionType?.name || 'Consultation'}\n📅 *Date:* ${dateStr}\n⏰ *Time:* ${startLocal}\n👤 *Name:* ${name}\n🎂 *DOB:* ${birthDate || 'Not provided'}\n📍 *Address:* ${address || 'Not provided'}\n\nYour appointment is officially booked and locked into our schedule. We look forward to seeing you!`,
-          booking,
-        );
-        this.conversationStates.delete(stateKey);
-      } catch (err: any) {
-        // Slot overlap or constraint error
-        await this.sendTextMessage(
-          client,
-          '⚠️ *Slot Unavailable*: That time slot was just taken by another client. Please reply "book" to pick another available slot.',
-        );
-        this.conversationStates.delete(stateKey);
-      }
-      return;
+      await this.sendTextMessage(
+        client,
+        `🎉 *Booking Confirmed!* 🎉\n\n📌 *Session:* ${sessionType?.name || 'Consultation'}\n📅 *Date:* ${dateStr}\n⏰ *Time:* ${startLocal}\n👤 *Name:* ${name}\n🎂 *DOB:* ${birthDate || 'Not provided'}\n📍 *Address:* ${address || 'Not provided'}\n\nYour appointment is officially booked and locked into our schedule. We look forward to seeing you! 🙏`,
+        booking,
+      );
+      this.conversationStates.delete(stateKey);
+    } catch (err: any) {
+      // Slot overlap or constraint error
+      await this.sendTextMessage(
+        client,
+        '⚠️ *Slot Unavailable*: That time slot was just taken by another client. Please reply "book" to pick another available slot.',
+      );
+      this.conversationStates.delete(stateKey);
     }
   }
 }
