@@ -24,21 +24,22 @@ import { WhatsAppEmbeddedSignupCallbackDto } from './dto/whatsapp-embedded-signu
 
 interface ConversationState {
   step:
-    | 'AWAITING_SESSION'
+    | 'AWAITING_SERVICE'
+    | 'AWAITING_QUANTITY'
     | 'AWAITING_SLOT'
-    | 'INTAKE_NAME'
-    | 'INTAKE_DOB'
-    | 'INTAKE_ADDRESS'
+    | 'AWAITING_NAME_ADDRESS'
     | 'AWAITING_CONFIRMATION';
+  serviceType?: 'JATA' | 'SAIET';
+  serviceName?: string;
+  quantity?: number;
+  totalPrice?: number;
   sessionTypeId?: string;
   selectedSlot?: string;
   adminId?: string;
-  intakeData?: {
-    name?: string;
-    birthDate?: string;
-    address?: string;
-  };
+  clientName?: string;
+  address?: string;
 }
+
 
 @Injectable()
 export class WhatsAppService {
@@ -542,7 +543,7 @@ export class WhatsAppService {
       return;
     }
 
-    // Intent to start booking
+    // Step 1: Start booking -> Choose "Jata" (जात) or "Saiet" (साइत)
     if (
       lower === 'book' ||
       lower.includes('schedule') ||
@@ -550,29 +551,17 @@ export class WhatsAppService {
       lower === 'start' ||
       (!state && (lower.includes('hi') || lower.includes('hello') || lower.includes('namaste') || lower.includes('book')))
     ) {
-      const sessionTypes = await this.sessionTypeService.getAll();
-      if (sessionTypes.length === 0) {
-        await this.sendTextMessage(
-          client,
-          'Namaste! There are currently no consultation session types configured. Please try again shortly.',
-        );
-        return;
-      }
+      await this.setConversationState(client, { step: 'AWAITING_SERVICE' });
 
-      await this.setConversationState(client, { step: 'AWAITING_SESSION' });
-
-      const rows = sessionTypes.map((st) => ({
-        id: `st_${st.id}`,
-        title: st.name.substring(0, 24),
-        description: `${st.durationMinutes} min (+${st.bufferMinutes}m buffer)`,
-      }));
-
-      await this.sendInteractiveList(
+      await this.sendInteractiveButtons(
         client,
         'Vedic Astrology Consultations',
-        'Please select a consultation type to view available openings:',
-        'Select Session',
-        [{ title: 'Available Consultations', rows }],
+        'Namaste! 🙏 Welcome to Vedic Astrology Consultation.\n\nPlease select your consultation type:',
+        [
+          { id: 'srv_jata', title: '📜 Jata (जात)' },
+          { id: 'srv_saiet', title: '⏳ Saiet (साइत)' },
+        ],
+        'Astrologer Booking System',
       );
       return;
     }
@@ -585,24 +574,107 @@ export class WhatsAppService {
       return;
     }
 
-    // Step 1: Session selected -> Show open slots (Multi-day smart availability)
-    if (state.step === 'AWAITING_SESSION') {
-      if (!replyId.startsWith('st_')) {
-        await this.sendTextMessage(
+    // Handle Step 1 Response: Service Type Selection
+    if (state.step === 'AWAITING_SERVICE') {
+      const isJata = replyId === 'srv_jata' || lower.includes('jata') || lower.includes('जात') || lower === '1';
+      const isSaiet = replyId === 'srv_saiet' || lower.includes('saiet') || lower.includes('साइत') || lower === '2';
+
+      if (!isJata && !isSaiet) {
+        await this.sendInteractiveButtons(
           client,
-          'Please select a consultation type from the list above 👆 (or reply *cancel* to restart).',
+          'Select Consultation',
+          'Please choose either *Jata (जात)* or *Saiet (साइत)* to continue:',
+          [
+            { id: 'srv_jata', title: '📜 Jata (जात)' },
+            { id: 'srv_saiet', title: '⏳ Saiet (साइत)' },
+          ],
         );
         return;
       }
 
-      const sessionTypeId = replyId.replace('st_', '');
-      state.sessionTypeId = sessionTypeId;
+      const allSessionTypes = await this.sessionTypeService.getAll();
+      const targetName = isJata ? 'jata' : 'saiet';
+      const sessionType =
+        allSessionTypes.find((st) => st.name.toLowerCase().includes(targetName)) ||
+        allSessionTypes[0];
 
-      const sessionType = await this.sessionTypeService.getById(sessionTypeId);
-      const adminId = sessionType.admin?.id || (await this.sessionTypeService.getAll())[0]?.admin?.id;
-      state.adminId = adminId;
+      if (!sessionType) {
+        await this.sendTextMessage(
+          client,
+          'No consultation session types configured. Please contact the administrator.',
+        );
+        await this.clearConversationState(client);
+        return;
+      }
 
-      // Find first day with available slots in next 7 days
+      state.serviceType = isJata ? 'JATA' : 'SAIET';
+      state.serviceName = isJata ? 'Jata (जात - जन्म कुण्डली)' : 'Saiet (साइत - शुभ मुहूर्त)';
+      state.sessionTypeId = sessionType.id;
+      state.adminId = sessionType.admin?.id || allSessionTypes[0]?.admin?.id;
+      state.step = 'AWAITING_QUANTITY';
+      await this.setConversationState(client, state);
+
+      // Step 2: Ask quantity (1 or 2 with pricing, max 2)
+      await this.sendInteractiveButtons(
+        client,
+        'Consultation Quantity',
+        `How many *${state.serviceName}* would you like to consult? (Maximum 2 per session)\n\n• *1 ${isJata ? 'Kundali' : 'Saiet'}* — Rs. 500\n• *2 ${isJata ? 'Kundalis' : 'Saiet'}* — Rs. 1,000`,
+        [
+          { id: 'qty_1', title: '1 (Rs. 500)' },
+          { id: 'qty_2', title: '2 (Rs. 1,000)' },
+        ],
+        'Maximum 2 per session',
+      );
+      return;
+    }
+
+    // Handle Step 2 Response: Quantity Selection (1 or 2, max 2)
+    if (state.step === 'AWAITING_QUANTITY') {
+      let qty: number | undefined;
+
+      if (replyId === 'qty_1' || lower === '1' || lower === 'one' || lower === 'ek') {
+        qty = 1;
+      } else if (replyId === 'qty_2' || lower === '2' || lower === 'two' || lower === 'dui') {
+        qty = 2;
+      } else {
+        const numMatch = lower.match(/\d+/);
+        if (numMatch) {
+          const parsedNum = parseInt(numMatch[0], 10);
+          if (parsedNum >= 3) {
+            await this.sendInteractiveButtons(
+              client,
+              'Limit Exceeded',
+              `⚠️ The Acharya reviews a maximum of *2 ${state.serviceName || 'consultations'}* per session.\n\nRequests for 3 or more cannot be accepted in a single session. Please choose 1 or 2:`,
+              [
+                { id: 'qty_1', title: '1 (Rs. 500)' },
+                { id: 'qty_2', title: '2 (Rs. 1,000)' },
+              ],
+            );
+            return;
+          }
+          if (parsedNum === 1 || parsedNum === 2) {
+            qty = parsedNum;
+          }
+        }
+      }
+
+      if (!qty) {
+        await this.sendInteractiveButtons(
+          client,
+          'Select Quantity',
+          `Please select *1* or *2* ${state.serviceName || 'consultations'}:`,
+          [
+            { id: 'qty_1', title: '1 (Rs. 500)' },
+            { id: 'qty_2', title: '2 (Rs. 1,000)' },
+          ],
+        );
+        return;
+      }
+
+      state.quantity = qty;
+      state.totalPrice = qty * 500;
+
+      // Step 3: Find and show open time slots
       let targetDateStr = '';
       let targetSlots: any[] = [];
 
@@ -610,7 +682,7 @@ export class WhatsAppService {
         const d = new Date();
         d.setDate(d.getDate() + offset);
         const checkDate = d.toISOString().split('T')[0];
-        const slots = await this.availabilityService.getAvailability(adminId, checkDate, sessionTypeId);
+        const slots = await this.availabilityService.getAvailability(state.adminId!, checkDate, state.sessionTypeId!);
 
         const validSlots = offset === 0
           ? slots.filter((s) => new Date(s.start).getTime() > Date.now())
@@ -626,7 +698,7 @@ export class WhatsAppService {
       if (targetSlots.length === 0) {
         await this.sendTextMessage(
           client,
-          `There are currently no open slots in the upcoming week for "${sessionType.name}". Please contact admin or try another session.`,
+          `There are currently no open slots in the upcoming week for "${state.serviceName}". Please contact admin or try another session.`,
         );
         await this.clearConversationState(client);
         return;
@@ -651,14 +723,14 @@ export class WhatsAppService {
       await this.sendInteractiveList(
         client,
         'Choose Time Slot',
-        `Available openings on ${formattedDate} for ${sessionType.name}:`,
+        `Available openings on ${formattedDate} for ${state.serviceName} (${state.quantity}x — Rs. ${state.totalPrice}):`,
         'Pick a Time',
         [{ title: `Openings (${formattedDate})`, rows: slotRows }],
       );
       return;
     }
 
-    // Step 2: Slot selected -> Start intake stepper (Step 1/3: Name)
+    // Handle Step 3 Response: Slot Selected
     if (state.step === 'AWAITING_SLOT') {
       if (!replyId.startsWith('slot_')) {
         await this.sendTextMessage(
@@ -670,86 +742,31 @@ export class WhatsAppService {
 
       const slotStart = decodeURIComponent(replyId.replace('slot_', ''));
       state.selectedSlot = slotStart;
-      state.step = 'INTAKE_NAME';
-      state.intakeData = {};
+      state.step = 'AWAITING_NAME_ADDRESS';
       await this.setConversationState(client, state);
 
+      // Step 4: Ask Full Name and Address (Second to last step)
       await this.sendTextMessage(
         client,
-        '✨ *Slot Reserved!*\n\nLet\'s collect your consultation details:\n\n1️⃣ *Step 1/3:* What is your *Full Name*?\n_(Tip: You can also reply with Name, Date of Birth, Address all in one message!)_',
+        '✨ *Slot Reserved!*\n\nPlease reply with your:\n*Full Name and Address*\n(e.g., Kirti Kirtan Joshi, Jwagal)',
       );
       return;
     }
 
-    // Step 3: Stepper Intake Processing (Fast-Track vs Step-by-Step)
-    if (
-      state.step === 'INTAKE_NAME' ||
-      state.step === 'INTAKE_DOB' ||
-      state.step === 'INTAKE_ADDRESS'
-    ) {
-      // 3a. Fast-track parser if user sent multiple comma/newline separated details at once
-      const multiParts = text.split(/,|\n/).map((s) => s.trim()).filter(Boolean);
-      if (multiParts.length >= 2) {
-        const name = multiParts[0];
-        let foundDob: string | undefined;
-        const addressParts: string[] = [];
+    // Handle Step 4 Response: Name and Address Received
+    if (state.step === 'AWAITING_NAME_ADDRESS') {
+      const parts = text.split(/,|\n/).map((s) => s.trim()).filter(Boolean);
+      const name = parts[0] || client.name || 'Client';
+      const address = parts.slice(1).join(', ').trim() || 'Kathmandu';
 
-        for (let i = 1; i < multiParts.length; i++) {
-          const item = multiParts[i];
-          const parsed = this.parseDateString(item);
-          if (parsed) {
-            foundDob = parsed;
-          } else {
-            addressParts.push(item);
-          }
-        }
+      state.clientName = name;
+      state.address = address;
 
-        state.intakeData = {
-          name: name || state.intakeData?.name || client.name,
-          birthDate: foundDob || state.intakeData?.birthDate,
-          address: addressParts.join(', ') || state.intakeData?.address || '',
-        };
-
-        return this.showBookingSummaryAndConfirm(client, state);
-      }
-
-      // 3b. Step-by-Step guided stepper
-      if (state.step === 'INTAKE_NAME') {
-        state.intakeData = { ...state.intakeData, name: text };
-        state.step = 'INTAKE_DOB';
-        await this.setConversationState(client, state);
-
-        await this.sendTextMessage(
-          client,
-          `Nice to meet you, *${text}*!\n\n2️⃣ *Step 2/3:* What is your *Date of Birth* (YYYY-MM-DD, e.g., 1995-08-15)?\n_(Or reply *skip*)_`,
-        );
-        return;
-      }
-
-      if (state.step === 'INTAKE_DOB') {
-        if (text.toLowerCase() !== 'skip') {
-          const parsed = this.parseDateString(text);
-          state.intakeData = { ...state.intakeData, birthDate: parsed || text };
-        }
-        state.step = 'INTAKE_ADDRESS';
-        await this.setConversationState(client, state);
-
-        await this.sendTextMessage(
-          client,
-          `Got it! 📅\n\n3️⃣ *Step 3/3:* What is your *Current City / Address*?\n_(Or reply *skip*)_`,
-        );
-        return;
-      }
-
-      if (state.step === 'INTAKE_ADDRESS') {
-        if (text.toLowerCase() !== 'skip') {
-          state.intakeData = { ...state.intakeData, address: text };
-        }
-        return this.showBookingSummaryAndConfirm(client, state);
-      }
+      // Step 5: Last step - Summary with Confirmation
+      return this.showBookingSummaryAndConfirm(client, state);
     }
 
-    // Step 4: Booking Summary Confirmation
+    // Handle Step 5 Response: Confirmation Card Action
     if (state.step === 'AWAITING_CONFIRMATION') {
       if (
         replyId === 'btn_confirm' ||
@@ -782,8 +799,6 @@ export class WhatsAppService {
     state.step = 'AWAITING_CONFIRMATION';
     await this.setConversationState(client, state);
 
-    const sessionType = await this.sessionTypeService.getById(state.sessionTypeId!);
-
     const dateStr = new Date(state.selectedSlot!).toLocaleDateString('en-US', {
       weekday: 'short',
       month: 'short',
@@ -796,23 +811,20 @@ export class WhatsAppService {
       minute: '2-digit',
     });
 
-    const name = state.intakeData?.name || client.name || 'Client';
-    const dob = state.intakeData?.birthDate || 'Not provided';
-    const address = state.intakeData?.address || 'Not provided';
-
     const summaryText =
       `📋 *Please confirm your consultation details:*\n\n` +
-      `📌 *Session:* ${sessionType?.name || 'Consultation'}\n` +
+      `📌 *Service:* ${state.serviceName || 'Consultation'}\n` +
+      `🔢 *Quantity:* ${state.quantity || 1}\n` +
+      `💰 *Total Fee:* Rs. ${state.totalPrice || 500}\n` +
       `📅 *Date:* ${dateStr}\n` +
       `⏰ *Time:* ${startLocal}\n` +
-      `👤 *Name:* ${name}\n` +
-      `🎂 *DOB:* ${dob}\n` +
-      `📍 *Address:* ${address}\n\n` +
-      `Tap *Confirm Booking* below to reserve your slot immediately!`;
+      `👤 *Client Name:* ${state.clientName || 'Client'}\n` +
+      `📍 *Address:* ${state.address || 'Not provided'}\n\n` +
+      `Tap *Confirm Booking* below to lock in your appointment!`;
 
     await this.sendInteractiveButtons(
       client,
-      'Booking Confirmation',
+      'Consultation Summary',
       summaryText,
       [
         { id: 'btn_confirm', title: '✅ Confirm Booking' },
@@ -826,15 +838,13 @@ export class WhatsAppService {
     client: Client,
     state: ConversationState,
   ) {
-    const name = state.intakeData?.name || client.name || 'Client';
-    const birthDate = state.intakeData?.birthDate;
-    const address = state.intakeData?.address;
+    const name = state.clientName || client.name || 'Client';
+    const address = state.address || undefined;
 
-    // Update client profile
+    // Update client profile in DB
     await this.clientService.update(client.id, {
       name,
-      birthDate: birthDate && /^\d{4}-\d{2}-\d{2}$/.test(birthDate) ? birthDate : undefined,
-      birthPlace: address || undefined,
+      birthPlace: address,
     });
 
     // Call backend POST /bookings transactionally
@@ -845,9 +855,8 @@ export class WhatsAppService {
         scheduledStart: state.selectedSlot!,
         source: BookingSource.WHATSAPP,
         clientId: client.id,
+        notes: `Service: ${state.serviceName} | Quantity: ${state.quantity}x | Fee: Rs. ${state.totalPrice} | Address: ${address || 'Not provided'}`,
       });
-
-      const sessionType = await this.sessionTypeService.getById(state.sessionTypeId!);
 
       const dateStr = new Date(booking.scheduledStart).toLocaleDateString('en-US', {
         weekday: 'short',
@@ -863,7 +872,14 @@ export class WhatsAppService {
 
       await this.sendTextMessage(
         client,
-        `🎉 *Booking Confirmed!* 🎉\n\n📌 *Session:* ${sessionType?.name || 'Consultation'}\n📅 *Date:* ${dateStr}\n⏰ *Time:* ${startLocal}\n👤 *Name:* ${name}\n🎂 *DOB:* ${birthDate || 'Not provided'}\n📍 *Address:* ${address || 'Not provided'}\n\nYour appointment is officially booked and locked into our schedule. We look forward to seeing you! 🙏`,
+        `🎉 *Booking Confirmed!* 🎉\n\n` +
+          `📌 *Service:* ${state.serviceName} (${state.quantity}x)\n` +
+          `💰 *Total Fee:* Rs. ${state.totalPrice}\n` +
+          `📅 *Date:* ${dateStr}\n` +
+          `⏰ *Time:* ${startLocal}\n` +
+          `👤 *Client Name:* ${name}\n` +
+          `📍 *Address:* ${address || 'Not provided'}\n\n` +
+          `Your appointment is officially booked and locked into the schedule. We look forward to seeing you! 🙏`,
         booking,
       );
       await this.clearConversationState(client);
@@ -877,3 +893,4 @@ export class WhatsAppService {
     }
   }
 }
+

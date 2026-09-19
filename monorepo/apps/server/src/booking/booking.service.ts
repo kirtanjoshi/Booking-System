@@ -137,6 +137,7 @@ export class BookingService {
         scheduledEnd,
         status: dto.source === BookingSource.ADMIN ? BookingStatus.CONFIRMED : BookingStatus.PENDING,
         source: dto.source,
+        notes: dto.notes,
       });
 
       try {
