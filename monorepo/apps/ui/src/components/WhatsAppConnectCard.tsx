@@ -108,6 +108,11 @@ export function WhatsAppConnectCard() {
           },
         );
       } else {
+        if (process.env.NODE_ENV === 'production') {
+          setError('Meta Embedded Signup is not configured. Missing NEXT_PUBLIC_META_CONFIG_ID or Meta JavaScript SDK.');
+          setActionLoading(false);
+          return;
+        }
         // Development simulation / direct connection
         await submitCallback('mock_auth_code_' + Date.now(), 'mock_phone_' + Date.now(), 'mock_waba_' + Date.now());
       }

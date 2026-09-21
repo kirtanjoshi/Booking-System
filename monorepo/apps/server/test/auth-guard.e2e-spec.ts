@@ -50,6 +50,25 @@ describe('Admin Authentication & Guard (e2e)', () => {
       expect(res.status).toBe(401);
       expect(res.body.message).toContain('Admin authentication required');
     });
+
+    it('should reject unauthenticated GET /admins/:id with 401', async () => {
+      const res = await request(app.getHttpServer()).get('/admins/00000000-0000-0000-0000-000000000000');
+      expect(res.status).toBe(401);
+    });
+
+    it('should reject unauthenticated PATCH /bookings/:id/notes with 401', async () => {
+      const res = await request(app.getHttpServer())
+        .patch('/bookings/00000000-0000-0000-0000-000000000000/notes')
+        .send({ notes: 'malicious note' });
+      expect(res.status).toBe(401);
+    });
+
+    it('should reject unauthenticated POST /bookings/:id/images with 401', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/bookings/00000000-0000-0000-0000-000000000000/images')
+        .send({ imageUrl: 'https://example.com/test.jpg' });
+      expect(res.status).toBe(401);
+    });
   });
 
   describe('Login & Authenticated access', () => {

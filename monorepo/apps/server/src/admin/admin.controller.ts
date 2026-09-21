@@ -15,8 +15,14 @@ export class AdminController {
   constructor(private readonly adminService: AdminService) {}
 
   @Get(':id')
+  @UseGuards(AdminAuthGuard)
   async getProfile(@Param('id') id: string) {
     return this.adminService.getAdminProfile(id);
+  }
+
+  @Get(':id/public')
+  async getPublicProfile(@Param('id') id: string) {
+    return this.adminService.getPublicPractitionerProfile(id);
   }
 
   @Post(':id/status-update')

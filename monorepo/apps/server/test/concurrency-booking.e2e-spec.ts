@@ -34,7 +34,7 @@ describe('Booking Concurrency & Double-Booking Prevention (e2e)', () => {
     // Clean up any bookings from prior test runs
     await dataSource.query(
       `DELETE FROM bookings WHERE client_id IN (
-        SELECT id FROM clients WHERE phone_number IN ('+9779811111111', '+9779822222222')
+        SELECT id FROM client_details WHERE phone_number IN ('+9779811111111', '+9779822222222')
       )`,
     );
   });
@@ -43,7 +43,7 @@ describe('Booking Concurrency & Double-Booking Prevention (e2e)', () => {
     // Clean up test bookings
     await dataSource.query(
       `DELETE FROM bookings WHERE client_id IN (
-        SELECT id FROM clients WHERE phone_number IN ('+9779811111111', '+9779822222222')
+        SELECT id FROM client_details WHERE phone_number IN ('+9779811111111', '+9779822222222')
       )`,
     );
     await app.close();

@@ -11,6 +11,8 @@ RUN pnpm install --frozen-lockfile
 
 WORKDIR /app/apps/server
 
+RUN pnpm build
+
 EXPOSE 3001
 
-CMD ["pnpm", "dev"]
+CMD ["pnpm", "start:prod"]

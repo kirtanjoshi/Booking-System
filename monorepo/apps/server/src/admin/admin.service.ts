@@ -23,11 +23,42 @@ export class AdminService {
     private readonly whatsappService: WhatsAppService,
   ) {}
 
-  async getAdminProfile(id: string): Promise<Omit<Admin, 'passwordHash'>> {
+  async getAdminProfile(id: string): Promise<Omit<Admin, 'passwordHash' | 'whatsappAccessToken'>> {
     const admin = await this.adminRepo.findOne({ where: { id } });
     if (!admin) throw new NotFoundException(`Admin with ID ${id} not found`);
-    const { passwordHash, ...result } = admin;
+    const { passwordHash, whatsappAccessToken, ...result } = admin;
     return result;
+  }
+
+  async getAdminCredentials(id: string): Promise<{
+    whatsappPhoneNumberId?: string;
+    whatsappAccessToken?: string;
+    whatsappWabaId?: string;
+  } | null> {
+    const admin = await this.adminRepo.findOne({ where: { id } });
+    if (!admin) return null;
+    return {
+      whatsappPhoneNumberId: admin.whatsappPhoneNumberId,
+      whatsappAccessToken: admin.whatsappAccessToken,
+      whatsappWabaId: admin.whatsappWabaId,
+    };
+  }
+
+  async getPublicPractitionerProfile(id: string) {
+    const admin = await this.adminRepo.findOne({
+      where: { id },
+      select: ['id', 'name', 'businessName', 'timezone'],
+    });
+    if (!admin) throw new NotFoundException(`Admin with ID ${id} not found`);
+    return admin;
+  }
+
+  async getDefaultAdmin(): Promise<Admin | null> {
+    const admins = await this.adminRepo.find({
+      order: { createdAt: 'ASC' },
+      take: 1,
+    });
+    return admins[0] || null;
   }
 
   async sendStatusUpdate(adminId: string, dto: StatusUpdateDto) {

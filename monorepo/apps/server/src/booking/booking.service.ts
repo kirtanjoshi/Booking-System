@@ -3,6 +3,8 @@ import {
   NotFoundException,
   ConflictException,
   BadRequestException,
+  UnauthorizedException,
+  ForbiddenException,
   Inject,
   forwardRef,
 } from '@nestjs/common';
@@ -17,6 +19,7 @@ import { WhatsAppService } from '../whatsapp/whatsapp.service';
 import { CreateBookingDto } from './dto/create-booking.dto';
 import { CancelBookingDto } from './dto/cancel-booking.dto';
 import { BookingSource, BookingStatus, MessageDirection, MessageType } from '../common/enums';
+import { localTimeToUtc } from '../common/utils/timezone.utils';
 
 @Injectable()
 export class BookingService {
@@ -185,14 +188,65 @@ export class BookingService {
     return saved;
   }
 
-  async updateNotes(id: string, notes: string): Promise<Booking> {
+  async updateNotes(
+    id: string,
+    notes: string,
+    session?: { adminId?: string; phoneNumber?: string; userId?: string },
+  ): Promise<Booking> {
+    if (!session || (!session.adminId && !session.phoneNumber && !session.userId)) {
+      throw new UnauthorizedException('Authentication required to modify consultation notes');
+    }
+
     const booking = await this.getById(id);
+
+    // If client is logged in, verify booking belongs to them
+    if (!session.adminId) {
+      const clientMatches =
+        (session.phoneNumber && booking.client?.phoneNumber === session.phoneNumber) ||
+        (session.userId && (booking.client as any)?.userId === session.userId);
+
+      if (!clientMatches) {
+        throw new ForbiddenException('You do not have permission to modify notes on this booking');
+      }
+    }
+
     booking.notes = notes;
     return this.bookingRepo.save(booking);
   }
 
-  async addImage(id: string, imageUrl: string): Promise<Booking> {
+  async addImage(
+    id: string,
+    imageUrl: string,
+    session?: { adminId?: string; phoneNumber?: string; userId?: string },
+  ): Promise<Booking> {
+    if (!session || (!session.adminId && !session.phoneNumber && !session.userId)) {
+      throw new UnauthorizedException('Authentication required to attach image');
+    }
+
     const booking = await this.getById(id);
+
+    // If client is logged in, verify booking belongs to them
+    if (!session.adminId) {
+      const clientMatches =
+        (session.phoneNumber && booking.client?.phoneNumber === session.phoneNumber) ||
+        (session.userId && (booking.client as any)?.userId === session.userId);
+
+      if (!clientMatches) {
+        throw new ForbiddenException('You do not have permission to attach images to this booking');
+      }
+    }
+
+    // Validate URL to prevent javascript: or internal protocol injection
+    try {
+      const parsed = new URL(imageUrl);
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new BadRequestException('Only http and https image URLs are allowed');
+      }
+    } catch (err: any) {
+      if (err instanceof BadRequestException) throw err;
+      throw new BadRequestException('Invalid image URL format');
+    }
+
     booking.imageUrls = [...(booking.imageUrls || []), imageUrl];
     return this.bookingRepo.save(booking);
   }
@@ -228,4 +282,77 @@ export class BookingService {
       .orderBy('booking.scheduledStart', 'DESC')
       .getMany();
   }
+
+  async getClientBookingOnDate(
+    clientId: string,
+    dateStr: string,
+    timeZone: string = 'Asia/Kathmandu',
+  ): Promise<Booking | null> {
+    const dayStart = localTimeToUtc(dateStr, '00:00', timeZone);
+    const dayEnd = localTimeToUtc(dateStr, '23:59', timeZone);
+    dayEnd.setSeconds(59, 999);
+
+    return this.bookingRepo
+      .createQueryBuilder('booking')
+      .leftJoinAndSelect('booking.sessionType', 'sessionType')
+      .leftJoinAndSelect('booking.admin', 'admin')
+      .where('booking.client_id = :clientId', { clientId })
+      .andWhere('booking.status IN (:...statuses)', {
+        statuses: [BookingStatus.PENDING, BookingStatus.CONFIRMED],
+      })
+      .andWhere('booking.scheduled_start < :dayEnd AND booking.scheduled_end > :dayStart', {
+        dayStart,
+        dayEnd,
+      })
+      .getOne();
+  }
+
+  async rescheduleBooking(id: string, newStartIso: string): Promise<Booking> {
+    return this.dataSource.transaction(async (manager) => {
+      const booking = await manager.findOne(Booking, {
+        where: { id },
+        relations: ['client', 'sessionType', 'admin'],
+      });
+      if (!booking) {
+        throw new NotFoundException(`Booking with ID ${id} not found`);
+      }
+
+      const totalMinutes =
+        booking.sessionType.durationMinutes + (booking.sessionType.bufferMinutes || 0);
+      const scheduledStart = new Date(newStartIso);
+      if (isNaN(scheduledStart.getTime())) {
+        throw new BadRequestException('Invalid new scheduledStart timestamp');
+      }
+      const scheduledEnd = new Date(scheduledStart.getTime() + totalMinutes * 60 * 1000);
+
+      booking.scheduledStart = scheduledStart;
+      booking.scheduledEnd = scheduledEnd;
+
+      try {
+        const saved = await manager.save(Booking, booking);
+
+        const logContent = `Booking rescheduled for ${booking.client.name || booking.client.phoneNumber} to ${scheduledStart.toISOString()}`;
+        await this.messageLogService.logMessage({
+          client: booking.client,
+          booking: saved,
+          direction: MessageDirection.OUTBOUND,
+          messageType: MessageType.STATUS_UPDATE,
+          content: logContent,
+        });
+
+        return saved;
+      } catch (err: any) {
+        if (
+          err.code === '23P01' ||
+          (err.message && err.message.includes('no_overlapping_bookings'))
+        ) {
+          throw new ConflictException(
+            'The selected time slot overlaps with an existing booking. Please select another slot.',
+          );
+        }
+        throw err;
+      }
+    });
+  }
 }
+

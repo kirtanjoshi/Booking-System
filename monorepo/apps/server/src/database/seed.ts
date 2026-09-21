@@ -12,11 +12,12 @@ export async function runSeed() {
   const sessionTypeRepo = runtimeDataSource.getRepository(SessionType);
   const availabilityRuleRepo = runtimeDataSource.getRepository(AvailabilityRule);
 
-  const phoneNumber = '+9779801234567';
+  const phoneNumber = process.env.SEED_ADMIN_PHONE || '+9779801234567';
   let admin = await adminRepo.findOne({ where: { phoneNumber } });
 
   if (!admin) {
-    const passwordHash = await bcrypt.hash('AdminPassword123!', 10);
+    const rawPassword = process.env.SEED_ADMIN_PASSWORD || 'AdminPassword123!';
+    const passwordHash = await bcrypt.hash(rawPassword, 10);
     admin = adminRepo.create({
       name: 'Acharya Shastri',
       businessName: 'Vedic Chart Astrology',

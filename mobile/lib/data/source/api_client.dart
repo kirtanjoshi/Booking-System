@@ -6,6 +6,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 class ApiClient {
   static String get baseUrl {
+    const envUrl = String.fromEnvironment('API_URL');
+    if (envUrl.isNotEmpty) {
+      return envUrl;
+    }
     if (kIsWeb || Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
       return 'http://localhost:3001';
     } else if (Platform.isAndroid) {

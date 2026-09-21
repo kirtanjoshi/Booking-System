@@ -12,6 +12,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
+import * as crypto from 'crypto';
 import { WhatsAppService } from './whatsapp.service';
 
 @Controller('webhooks/whatsapp')
@@ -29,14 +30,22 @@ export class WhatsAppWebhookController {
     @Res() res: Response,
   ) {
     const expectedToken = process.env.WHATSAPP_VERIFY_TOKEN;
-    this.logger.log(`Webhook verification request received. mode: ${mode}, token: ${token}, expectedToken: ${expectedToken}`);
+    this.logger.log(`Webhook verification request received. mode: ${mode}`);
 
-    if (mode === 'subscribe' && token === expectedToken) {
-      this.logger.log('✅ Webhook handshake verified successfully!');
-      return res.status(HttpStatus.OK).send(challenge);
+    if (mode === 'subscribe' && expectedToken && token) {
+      const tokenBuf = Buffer.from(token);
+      const expectedBuf = Buffer.from(expectedToken);
+      const isMatch =
+        tokenBuf.length === expectedBuf.length &&
+        crypto.timingSafeEqual(tokenBuf, expectedBuf);
+
+      if (isMatch) {
+        this.logger.log('✅ Webhook handshake verified successfully!');
+        return res.status(HttpStatus.OK).send(challenge);
+      }
     }
 
-    this.logger.warn(`❌ Webhook handshake failed. Token mismatch: received "${token}", expected "${expectedToken}"`);
+    this.logger.warn('❌ Webhook handshake failed: token mismatch or invalid parameters');
     throw new ForbiddenException('Verification token mismatch');
   }
 

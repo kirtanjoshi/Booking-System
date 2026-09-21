@@ -20,12 +20,16 @@ export class SessionTypeService {
   async getAll(adminId?: string): Promise<SessionType[]> {
     return this.sessionTypeRepo.find({
       where: adminId ? { admin: { id: adminId } } : {},
+      relations: ['admin'],
       order: { durationMinutes: 'ASC' },
     });
   }
 
   async getById(id: string): Promise<SessionType> {
-    const st = await this.sessionTypeRepo.findOne({ where: { id } });
+    const st = await this.sessionTypeRepo.findOne({
+      where: { id },
+      relations: ['admin'],
+    });
     if (!st) throw new NotFoundException(`SessionType with ID ${id} not found`);
     return st;
   }

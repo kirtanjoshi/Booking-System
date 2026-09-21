@@ -7,18 +7,18 @@ import {
   Res,
   HttpCode,
   HttpStatus,
-  UseGuards,
   UnauthorizedException,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
+import { Throttle } from '@nestjs/throttler';
 import { AuthenticationService } from './authentication.service';
 import { LoginDto } from './dto/login.dto';
-import { AdminAuthGuard } from '../common/guards/admin-auth.guard';
 
 @Controller('auth')
 export class AuthenticationController {
   constructor(private readonly authService: AuthenticationService) {}
 
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
   @Post('login')
   @HttpCode(HttpStatus.OK)
   async login(
@@ -26,16 +26,21 @@ export class AuthenticationController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const user = await this.authService.validateAdmin(loginDto);
-    (req as any).session.adminId = user.id;
+    const user = await this.authService.validateUser(loginDto);
+    const roleCode = user.role?.code || (user as any).roleCode || 'USER';
+
     (req as any).session.userId = user.id;
-    (req as any).session.role = user.role;
+    (req as any).session.role = roleCode;
     (req as any).session.phoneNumber = user.phoneNumber;
+
+    if (roleCode === 'ADMIN') {
+      (req as any).session.adminId = user.id;
+    }
 
     return {
       message: 'Login successful',
       user,
-      admin: user,
+      admin: roleCode === 'ADMIN' ? user : undefined,
     };
   }
 
@@ -54,13 +59,15 @@ export class AuthenticationController {
   }
 
   @Get('me')
-  @UseGuards(AdminAuthGuard)
   async me(@Req() req: Request) {
-    const adminId = (req as any).session.adminId;
-    const admin = await this.authService.getAdminById(adminId);
-    if (!admin) {
-      throw new UnauthorizedException('Admin not found');
+    const userId = (req as any).session.userId || (req as any).session.adminId;
+    if (!userId) {
+      throw new UnauthorizedException('Authentication required');
     }
-    return admin;
+    const user = await this.authService.getUserById(userId);
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+    return user;
   }
 }

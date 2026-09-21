@@ -16,6 +16,7 @@ import {
   UpdateAvailabilityRuleDto,
 } from './dto/create-availability-rule.dto';
 import { CreateDateOverrideDto } from './dto/create-date-override.dto';
+import { localTimeToUtc, formatInTimeZone } from '../common/utils/timezone.utils';
 
 export interface FreeTimeSlot {
   start: string; // ISO string
@@ -43,10 +44,20 @@ export class AvailabilityService {
     dateStr: string,
     sessionTypeId: string,
   ): Promise<FreeTimeSlot[]> {
+    if (!adminId) {
+      throw new BadRequestException('adminId is required');
+    }
+
     // Validate date format YYYY-MM-DD
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
       throw new BadRequestException('Invalid date format, expected YYYY-MM-DD');
     }
+
+    const admin = await this.adminRepo.findOne({ where: { id: adminId } });
+    if (!admin) {
+      throw new NotFoundException(`Admin with ID ${adminId} not found`);
+    }
+    const timeZone = admin.timezone || 'Asia/Kathmandu';
 
     const sessionType = await this.sessionTypeRepo.findOne({
       where: { id: sessionTypeId },
@@ -92,9 +103,10 @@ export class AvailabilityService {
       return [];
     }
 
-    // Fetch existing bookings for this admin overlapping this day
-    const dayStart = new Date(`${dateStr}T00:00:00.000Z`);
-    const dayEnd = new Date(`${dateStr}T23:59:59.999Z`);
+    // Fetch existing bookings for this admin overlapping this day in the admin's timezone
+    const dayStart = localTimeToUtc(dateStr, '00:00', timeZone);
+    const dayEnd = localTimeToUtc(dateStr, '23:59', timeZone);
+    dayEnd.setSeconds(59, 999);
 
     const existingBookings = await this.bookingRepo
       .createQueryBuilder('booking')
@@ -111,15 +123,8 @@ export class AvailabilityService {
     const candidateSlots: { start: Date; end: Date }[] = [];
 
     for (const win of windows) {
-      // win.start and win.end format: "10:00" or "10:00:00"
-      const startParts = win.start.split(':');
-      const endParts = win.end.split(':');
-
-      const winStartDate = new Date(`${dateStr}T00:00:00.000Z`);
-      winStartDate.setUTCHours(parseInt(startParts[0], 10), parseInt(startParts[1], 10), 0, 0);
-
-      const winEndDate = new Date(`${dateStr}T00:00:00.000Z`);
-      winEndDate.setUTCHours(parseInt(endParts[0], 10), parseInt(endParts[1], 10), 0, 0);
+      const winStartDate = localTimeToUtc(dateStr, win.start, timeZone);
+      const winEndDate = localTimeToUtc(dateStr, win.end, timeZone);
 
       let current = winStartDate.getTime();
       const endLimit = winEndDate.getTime();
@@ -146,11 +151,11 @@ export class AvailabilityService {
 
     return candidateSlots.map((s) => {
       const formatTime = (d: Date) => {
-        const hours = d.getUTCHours();
-        const minutes = d.getUTCMinutes().toString().padStart(2, '0');
-        const ampm = hours >= 12 ? 'PM' : 'AM';
-        const h12 = hours % 12 || 12;
-        return `${h12}:${minutes} ${ampm}`;
+        return formatInTimeZone(d, timeZone, {
+          hour: 'numeric',
+          minute: '2-digit',
+          hour12: true,
+        });
       };
 
       return {
@@ -159,6 +164,45 @@ export class AvailabilityService {
         displayTime: `${formatTime(s.start)} - ${formatTime(s.end)}`,
       };
     });
+  }
+
+  async isSlotAvailable(
+    adminId: string,
+    sessionTypeId: string,
+    slotStartIso: string,
+  ): Promise<boolean> {
+    if (!adminId) {
+      throw new BadRequestException('adminId is required');
+    }
+
+    const sessionType = await this.sessionTypeRepo.findOne({
+      where: { id: sessionTypeId },
+    });
+    if (!sessionType) {
+      throw new NotFoundException(`SessionType with ID ${sessionTypeId} not found`);
+    }
+
+    const slotDurationMinutes =
+      sessionType.durationMinutes + (sessionType.bufferMinutes || 0);
+    const slotStart = new Date(slotStartIso);
+    if (isNaN(slotStart.getTime())) {
+      throw new BadRequestException('Invalid slotStart ISO timestamp');
+    }
+    const slotEnd = new Date(slotStart.getTime() + slotDurationMinutes * 60 * 1000);
+
+    const overlappingCount = await this.bookingRepo
+      .createQueryBuilder('booking')
+      .where('booking.admin_id = :adminId', { adminId })
+      .andWhere('booking.status IN (:...statuses)', {
+        statuses: [BookingStatus.PENDING, BookingStatus.CONFIRMED],
+      })
+      .andWhere('booking.scheduled_start < :slotEnd AND booking.scheduled_end > :slotStart', {
+        slotStart,
+        slotEnd,
+      })
+      .getCount();
+
+    return overlappingCount === 0;
   }
 
   // AvailabilityRule CRUD

@@ -21,6 +21,7 @@ import {
   MessageType,
 } from '../common/enums';
 import { WhatsAppEmbeddedSignupCallbackDto } from './dto/whatsapp-embedded-signup.dto';
+import { getLocalDateString, formatInTimeZone } from '../common/utils/timezone.utils';
 
 interface ConversationState {
   step:
@@ -28,7 +29,8 @@ interface ConversationState {
     | 'AWAITING_QUANTITY'
     | 'AWAITING_SLOT'
     | 'AWAITING_NAME_ADDRESS'
-    | 'AWAITING_CONFIRMATION';
+    | 'AWAITING_CONFIRMATION'
+    | 'AWAITING_SAME_DAY_CHOICE';
   serviceType?: 'JATA' | 'SAIET';
   serviceName?: string;
   quantity?: number;
@@ -38,6 +40,8 @@ interface ConversationState {
   adminId?: string;
   clientName?: string;
   address?: string;
+  rescheduleBookingId?: string;
+  existingBookingIdOnDay?: string;
 }
 
 
@@ -97,10 +101,10 @@ export class WhatsAppService {
 
     if (adminId) {
       try {
-        const admin = await this.adminService.getAdminProfile(adminId) as any;
-        if (admin?.whatsappPhoneNumberId && admin?.whatsappAccessToken) {
-          phoneNumberId = admin.whatsappPhoneNumberId;
-          accessToken = admin.whatsappAccessToken;
+        const creds = await this.adminService.getAdminCredentials(adminId);
+        if (creds?.whatsappPhoneNumberId && creds?.whatsappAccessToken) {
+          phoneNumberId = creds.whatsappPhoneNumberId;
+          accessToken = creds.whatsappAccessToken;
         }
       } catch (err: any) {
         this.logger.warn(`Could not load custom WhatsApp credentials for admin ${adminId}: ${err.message}`);
@@ -108,6 +112,11 @@ export class WhatsAppService {
     }
 
     if (!phoneNumberId || !accessToken) {
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error(
+          'FATAL: WhatsApp credentials (WHATSAPP_PHONE_NUMBER_ID or WHATSAPP_ACCESS_TOKEN) are missing. Outbound message cannot be sent in production.',
+        );
+      }
       this.logger.warn('WhatsApp credentials not set; simulating outbound message send.');
       return `mock_msg_${Date.now()}`;
     }
@@ -141,6 +150,11 @@ export class WhatsAppService {
     const appSecret = process.env.META_APP_SECRET || process.env.WHATSAPP_APP_SECRET;
 
     if (!appId || !appSecret) {
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error(
+          'FATAL: META_APP_ID or META_APP_SECRET is not configured for WhatsApp Embedded Signup OAuth exchange in production.',
+        );
+      }
       this.logger.warn('META_APP_ID or META_APP_SECRET not configured, simulating OAuth token exchange in development');
       const mockToken = `mock_eaab_token_${Date.now()}`;
       await this.adminService.updateWhatsAppCredentials(adminId, {
@@ -443,7 +457,11 @@ export class WhatsAppService {
     }
 
     // Resolve client
-    const client = await this.clientService.findOrCreate({ phoneNumber: fromPhone });
+    const profileName = changes?.contacts?.[0]?.profile?.name;
+    const client = await this.clientService.findOrCreate({
+      phoneNumber: fromPhone,
+      name: profileName || undefined,
+    });
 
     let userText = '';
     let selectedReplyId = '';
@@ -475,39 +493,15 @@ export class WhatsAppService {
   }
 
   private async getConversationState(client: Client): Promise<ConversationState | undefined> {
-    const memState = this.conversationStates.get(client.phoneNumber);
-    if (memState) return memState;
-
-    if (client.notes && client.notes.startsWith('__CONV_STATE__:')) {
-      try {
-        const state = JSON.parse(client.notes.replace('__CONV_STATE__:', ''));
-        this.conversationStates.set(client.phoneNumber, state);
-        return state;
-      } catch {
-        return undefined;
-      }
-    }
-    return undefined;
+    return this.conversationStates.get(client.phoneNumber);
   }
 
   private async setConversationState(client: Client, state: ConversationState) {
     this.conversationStates.set(client.phoneNumber, state);
-    try {
-      await this.clientService.update(client.id, {
-        notes: `__CONV_STATE__:${JSON.stringify(state)}`,
-      });
-    } catch (err: any) {
-      this.logger.warn(`Could not persist conversation state: ${err.message}`);
-    }
   }
 
   private async clearConversationState(client: Client) {
     this.conversationStates.delete(client.phoneNumber);
-    try {
-      await this.clientService.update(client.id, { notes: undefined });
-    } catch (err: any) {
-      this.logger.warn(`Could not clear conversation state: ${err.message}`);
-    }
   }
 
   private parseDateString(str: string): string | undefined {
@@ -543,6 +537,63 @@ export class WhatsAppService {
       return;
     }
 
+    // Handle quick action: Change Time / Reschedule existing booking
+    if (replyId === 'btn_reschedule' || lower === 'change time' || lower === 'reschedule') {
+      const upcoming = await this.bookingService.getUserUpcomingBookings(client.phoneNumber);
+      if (upcoming.length > 0) {
+        const targetBooking = upcoming[0];
+        const nextState: ConversationState = {
+          step: 'AWAITING_SLOT',
+          rescheduleBookingId: targetBooking.id,
+          adminId: targetBooking.admin?.id,
+          sessionTypeId: targetBooking.sessionType?.id,
+          serviceName: targetBooking.sessionType?.name,
+          clientName: client.name,
+          address: client.birthPlace,
+        };
+        await this.setConversationState(client, nextState);
+        await this.presentAvailableSlots(
+          client,
+          nextState,
+          'Select New Time',
+          `Please pick your new preferred time slot for *${targetBooking.sessionType?.name}*:`,
+        );
+        return;
+      }
+    }
+
+    // Handle quick action: Cancel existing booking from prompt
+    if (replyId === 'btn_cancel_booking' || lower === 'cancel booking') {
+      const upcoming = await this.bookingService.getUserUpcomingBookings(client.phoneNumber);
+      if (upcoming.length > 0) {
+        await this.bookingService.cancelBooking(upcoming[0].id, {
+          cancelledReason: 'Cancelled by client via WhatsApp',
+        });
+        await this.clearConversationState(client);
+        await this.sendTextMessage(
+          client,
+          'Your upcoming consultation has been cancelled. Whenever you wish to book again, simply reply "book". 🙏',
+        );
+        return;
+      }
+    }
+
+    // Handle quick action: Book new day
+    if (replyId === 'btn_book_new' || lower === 'book new' || lower === 'book new day') {
+      await this.setConversationState(client, { step: 'AWAITING_SERVICE' });
+      await this.sendInteractiveButtons(
+        client,
+        'Vedic Astrology Consultations',
+        'Namaste! 🙏 Please select your consultation type:',
+        [
+          { id: 'srv_jata', title: '📜 Jata (जात)' },
+          { id: 'srv_saiet', title: '⏳ Saiet (साइत)' },
+        ],
+        'Astrologer Booking System',
+      );
+      return;
+    }
+
     // Step 1: Start booking -> Choose "Jata" (जात) or "Saiet" (साइत)
     if (
       lower === 'book' ||
@@ -551,6 +602,52 @@ export class WhatsAppService {
       lower === 'start' ||
       (!state && (lower.includes('hi') || lower.includes('hello') || lower.includes('namaste') || lower.includes('book')))
     ) {
+      // Check if client already has an active upcoming booking
+      const upcoming = await this.bookingService.getUserUpcomingBookings(client.phoneNumber);
+      if (upcoming.length > 0) {
+        const nextBooking = upcoming[0];
+        const admin = nextBooking.admin?.id
+          ? await this.adminService.getAdminProfile(nextBooking.admin.id).catch(() => null)
+          : null;
+        const timeZone = (admin as any)?.timezone || 'Asia/Kathmandu';
+        const dateStr = formatInTimeZone(new Date(nextBooking.scheduledStart), timeZone, {
+          weekday: 'short',
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+        });
+        const timeStr = formatInTimeZone(new Date(nextBooking.scheduledStart), timeZone, {
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+
+        await this.setConversationState(client, {
+          step: 'AWAITING_SERVICE',
+          rescheduleBookingId: nextBooking.id,
+          adminId: nextBooking.admin?.id,
+          sessionTypeId: nextBooking.sessionType?.id,
+          serviceName: nextBooking.sessionType?.name,
+        });
+
+        const clientName = client.name || 'Client';
+        await this.sendInteractiveButtons(
+          client,
+          'Active Consultation',
+          `Namaste ${clientName}! 🙏\n\nYou currently have an upcoming consultation:\n\n` +
+            `📌 *Service:* ${nextBooking.sessionType?.name}\n` +
+            `📅 *Date:* ${dateStr}\n` +
+            `⏰ *Time:* ${timeStr}\n\n` +
+            `What would you like to do?`,
+          [
+            { id: 'btn_reschedule', title: '🔄 Change Time' },
+            { id: 'btn_book_new', title: '📅 Book New Day' },
+            { id: 'btn_cancel_booking', title: '❌ Cancel Booking' },
+          ],
+          'Astrologer Booking System',
+        );
+        return;
+      }
+
       await this.setConversationState(client, { step: 'AWAITING_SERVICE' });
 
       await this.sendInteractiveButtons(
@@ -610,7 +707,12 @@ export class WhatsAppService {
       state.serviceType = isJata ? 'JATA' : 'SAIET';
       state.serviceName = isJata ? 'Jata (जात - जन्म कुण्डली)' : 'Saiet (साइत - शुभ मुहूर्त)';
       state.sessionTypeId = sessionType.id;
-      state.adminId = sessionType.admin?.id || allSessionTypes[0]?.admin?.id;
+      let adminId = sessionType.admin?.id || allSessionTypes.find((st) => st.admin?.id)?.admin?.id;
+      if (!adminId) {
+        const defaultAdmin = await this.adminService.getDefaultAdmin();
+        adminId = defaultAdmin?.id;
+      }
+      state.adminId = adminId;
       state.step = 'AWAITING_QUANTITY';
       await this.setConversationState(client, state);
 
@@ -675,58 +777,10 @@ export class WhatsAppService {
       state.totalPrice = qty * 500;
 
       // Step 3: Find and show open time slots
-      let targetDateStr = '';
-      let targetSlots: any[] = [];
-
-      for (let offset = 0; offset < 7; offset++) {
-        const d = new Date();
-        d.setDate(d.getDate() + offset);
-        const checkDate = d.toISOString().split('T')[0];
-        const slots = await this.availabilityService.getAvailability(state.adminId!, checkDate, state.sessionTypeId!);
-
-        const validSlots = offset === 0
-          ? slots.filter((s) => new Date(s.start).getTime() > Date.now())
-          : slots;
-
-        if (validSlots.length > 0) {
-          targetDateStr = checkDate;
-          targetSlots = validSlots;
-          break;
-        }
-      }
-
-      if (targetSlots.length === 0) {
-        await this.sendTextMessage(
-          client,
-          `There are currently no open slots in the upcoming week for "${state.serviceName}". Please contact admin or try another session.`,
-        );
+      const slotsPresented = await this.presentAvailableSlots(client, state);
+      if (!slotsPresented) {
         await this.clearConversationState(client);
-        return;
       }
-
-      state.step = 'AWAITING_SLOT';
-      await this.setConversationState(client, state);
-
-      const isToday = targetDateStr === new Date().toISOString().split('T')[0];
-      const formattedDate = new Date(`${targetDateStr}T00:00:00Z`).toLocaleDateString('en-US', {
-        weekday: 'short',
-        month: 'short',
-        day: 'numeric',
-      });
-
-      const slotRows = targetSlots.slice(0, 10).map((s) => ({
-        id: `slot_${encodeURIComponent(s.start)}`,
-        title: s.displayTime.substring(0, 24),
-        description: isToday ? 'Today' : formattedDate,
-      }));
-
-      await this.sendInteractiveList(
-        client,
-        'Choose Time Slot',
-        `Available openings on ${formattedDate} for ${state.serviceName} (${state.quantity}x — Rs. ${state.totalPrice}):`,
-        'Pick a Time',
-        [{ title: `Openings (${formattedDate})`, rows: slotRows }],
-      );
       return;
     }
 
@@ -741,7 +795,143 @@ export class WhatsAppService {
       }
 
       const slotStart = decodeURIComponent(replyId.replace('slot_', ''));
+
+      // Validate slot availability immediately
+      const isAvailable = await this.availabilityService.isSlotAvailable(
+        state.adminId!,
+        state.sessionTypeId!,
+        slotStart,
+      );
+
+      if (!isAvailable) {
+        await this.sendTextMessage(
+          client,
+          '⚠️ *Slot Unavailable*: That time slot was just taken by another client or is no longer available.',
+        );
+        await this.presentAvailableSlots(
+          client,
+          state,
+          'Choose Another Slot',
+          'Please select another available time slot below to continue:',
+        );
+        return;
+      }
+
+      // Case A: If client is in dedicated reschedule mode for an existing booking
+      if (state.rescheduleBookingId) {
+        try {
+          const rescheduled = await this.bookingService.rescheduleBooking(
+            state.rescheduleBookingId,
+            slotStart,
+          );
+
+          const admin = state.adminId
+            ? await this.adminService.getAdminProfile(state.adminId).catch(() => null)
+            : null;
+          const timeZone = (admin as any)?.timezone || 'Asia/Kathmandu';
+          const newStart = new Date(rescheduled.scheduledStart);
+          const newDateStr = formatInTimeZone(newStart, timeZone, {
+            weekday: 'short',
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+          });
+          const newTimeStr = formatInTimeZone(newStart, timeZone, {
+            hour: '2-digit',
+            minute: '2-digit',
+          });
+
+          await this.sendTextMessage(
+            client,
+            `🎉 *Appointment Rescheduled!* 🎉\n\n` +
+              `Your consultation has been successfully moved to:\n` +
+              `📅 *Date:* ${newDateStr}\n` +
+              `⏰ *New Time:* ${newTimeStr}\n` +
+              `📌 *Service:* ${state.serviceName || rescheduled.sessionType?.name}\n\n` +
+              `We look forward to seeing you at your new time! 🙏`,
+            rescheduled,
+          );
+          await this.clearConversationState(client);
+          return;
+        } catch (err: any) {
+          await this.sendTextMessage(
+            client,
+            '⚠️ Could not reschedule to that slot. Please select another time slot:',
+          );
+          await this.presentAvailableSlots(client, state, 'Select Another Slot');
+          return;
+        }
+      }
+
+      // Case B: Same-Day Double Booking Prevention
+      const admin = state.adminId
+        ? await this.adminService.getAdminProfile(state.adminId).catch(() => null)
+        : null;
+      const timeZone = (admin as any)?.timezone || 'Asia/Kathmandu';
+      const slotDate = new Date(slotStart);
+      const targetDateStr = new Intl.DateTimeFormat('en-CA', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(slotDate);
+
+      const existingBookingOnDay = await this.bookingService.getClientBookingOnDate(
+        client.id,
+        targetDateStr,
+        timeZone,
+      );
+
+      if (existingBookingOnDay && existingBookingOnDay.id !== state.rescheduleBookingId) {
+        const existingStart = new Date(existingBookingOnDay.scheduledStart);
+        const existingTimeFormatted = formatInTimeZone(existingStart, timeZone, {
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+        const newTimeFormatted = formatInTimeZone(slotDate, timeZone, {
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+        const dateFormatted = formatInTimeZone(slotDate, timeZone, {
+          weekday: 'short',
+          month: 'short',
+          day: 'numeric',
+        });
+
+        state.step = 'AWAITING_SAME_DAY_CHOICE';
+        state.selectedSlot = slotStart;
+        state.existingBookingIdOnDay = existingBookingOnDay.id;
+        await this.setConversationState(client, state);
+
+        await this.sendInteractiveButtons(
+          client,
+          'Same-Day Booking Notice',
+          `⚠️ You already have an appointment on ${dateFormatted}:\n\n` +
+            `⏰ *Current Time:* ${existingTimeFormatted}\n` +
+            `📌 *Service:* ${existingBookingOnDay.sessionType?.name}\n\n` +
+            `To maintain the best consultation quality, we limit bookings to 1 session per client per day.\n\n` +
+            `Would you like to move your appointment to *${newTimeFormatted}* instead?`,
+          [
+            { id: 'btn_same_day_reschedule', title: `🔄 Move to ${newTimeFormatted}`.substring(0, 20) },
+            { id: 'btn_same_day_keep', title: `Keep ${existingTimeFormatted}`.substring(0, 20) },
+          ],
+          '1 session per day policy',
+        );
+        return;
+      }
+
       state.selectedSlot = slotStart;
+
+      // Auto-prefill if client name and address already exist on profile or in state
+      const knownName = state.clientName || client.name;
+      const knownAddress = state.address || client.birthPlace;
+
+      if (knownName && knownAddress) {
+        state.clientName = knownName;
+        state.address = knownAddress;
+        return this.showBookingSummaryAndConfirm(client, state);
+      }
+
       state.step = 'AWAITING_NAME_ADDRESS';
       await this.setConversationState(client, state);
 
@@ -762,6 +952,12 @@ export class WhatsAppService {
       state.clientName = name;
       state.address = address;
 
+      // Immediately persist customer details to database so they are never lost
+      await this.clientService.update(client.id, {
+        name,
+        birthPlace: address,
+      });
+
       // Step 5: Last step - Summary with Confirmation
       return this.showBookingSummaryAndConfirm(client, state);
     }
@@ -775,6 +971,19 @@ export class WhatsAppService {
         lower === 'ok'
       ) {
         return this.executeConfirmedBooking(client, state);
+      } else if (
+        replyId === 'btn_edit_details' ||
+        lower === 'edit' ||
+        lower === 'update' ||
+        lower.includes('change')
+      ) {
+        state.step = 'AWAITING_NAME_ADDRESS';
+        await this.setConversationState(client, state);
+        await this.sendTextMessage(
+          client,
+          'Please reply with your updated:\n*Full Name and Address*\n(e.g., Kirti Kirtan Joshi, Jwagal)',
+        );
+        return;
       } else if (replyId === 'btn_cancel' || lower.includes('cancel')) {
         await this.clearConversationState(client);
         await this.sendTextMessage(
@@ -785,11 +994,147 @@ export class WhatsAppService {
       } else {
         await this.sendTextMessage(
           client,
-          'Please tap *Confirm Booking* below or reply *confirm* to finalize your appointment, or reply *cancel* to restart.',
+          'Please tap *Confirm Booking* below, tap *Update Details* to change your info, or reply *cancel* to restart.',
         );
         return;
       }
     }
+
+    // Handle Step: Same-Day Double Booking Choice Response
+    if (state.step === 'AWAITING_SAME_DAY_CHOICE') {
+      if (
+        replyId === 'btn_same_day_reschedule' ||
+        lower.includes('move') ||
+        lower.includes('reschedule') ||
+        lower.includes('yes')
+      ) {
+        try {
+          const rescheduled = await this.bookingService.rescheduleBooking(
+            state.existingBookingIdOnDay!,
+            state.selectedSlot!,
+          );
+
+          const admin = state.adminId
+            ? await this.adminService.getAdminProfile(state.adminId).catch(() => null)
+            : null;
+          const timeZone = (admin as any)?.timezone || 'Asia/Kathmandu';
+          const newStart = new Date(rescheduled.scheduledStart);
+          const newDateStr = formatInTimeZone(newStart, timeZone, {
+            weekday: 'short',
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+          });
+          const newTimeStr = formatInTimeZone(newStart, timeZone, {
+            hour: '2-digit',
+            minute: '2-digit',
+          });
+
+          await this.sendTextMessage(
+            client,
+            `🎉 *Appointment Rescheduled!* 🎉\n\n` +
+              `Your consultation on ${newDateStr} has been successfully moved to:\n` +
+              `⏰ *New Time:* ${newTimeStr}\n` +
+              `📌 *Service:* ${rescheduled.sessionType?.name}\n\n` +
+              `We look forward to seeing you at your new time! 🙏`,
+            rescheduled,
+          );
+          await this.clearConversationState(client);
+          return;
+        } catch (err: any) {
+          await this.sendTextMessage(
+            client,
+            '⚠️ Could not reschedule to that slot. Please reply "book" to view available slots.',
+          );
+          await this.clearConversationState(client);
+          return;
+        }
+      } else {
+        await this.clearConversationState(client);
+        await this.sendTextMessage(
+          client,
+          'Got it! Your existing appointment remains confirmed. Reply "book" whenever you need help. 🙏',
+        );
+        return;
+      }
+    }
+  }
+
+  private async presentAvailableSlots(
+    client: Client,
+    state: ConversationState,
+    headerText: string = 'Choose Time Slot',
+    introText?: string,
+  ): Promise<boolean> {
+    const admin = state.adminId
+      ? await this.adminService.getAdminProfile(state.adminId).catch(() => null)
+      : null;
+    const timeZone = (admin as any)?.timezone || 'Asia/Kathmandu';
+
+    let targetDateStr = '';
+    let targetSlots: any[] = [];
+
+    for (let offset = 0; offset < 7; offset++) {
+      const checkDate = getLocalDateString(offset, timeZone);
+      const slots = await this.availabilityService.getAvailability(
+        state.adminId!,
+        checkDate,
+        state.sessionTypeId!,
+      );
+
+      const validSlots = offset === 0
+        ? slots.filter((s) => new Date(s.start).getTime() > Date.now())
+        : slots;
+
+      if (validSlots.length > 0) {
+        targetDateStr = checkDate;
+        targetSlots = validSlots;
+        break;
+      }
+    }
+
+    if (targetSlots.length === 0) {
+      await this.sendTextMessage(
+        client,
+        `There are currently no open slots in the upcoming week for "${state.serviceName}". Please contact admin or try another session.`,
+      );
+      return false;
+    }
+
+    state.step = 'AWAITING_SLOT';
+    await this.setConversationState(client, state);
+
+    const todayDateStr = getLocalDateString(0, timeZone);
+    const isToday = targetDateStr === todayDateStr;
+    const formattedDate = formatInTimeZone(
+      new Date(`${targetDateStr}T12:00:00Z`),
+      timeZone,
+      {
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+      },
+    );
+
+    const slotRows = targetSlots.slice(0, 10).map((s) => ({
+      id: `slot_${encodeURIComponent(s.start)}`,
+      title: s.displayTime.substring(0, 24),
+      description: isToday ? 'Today' : formattedDate,
+    }));
+
+    const bodyText =
+      introText ||
+      `Available openings on ${formattedDate} for ${state.serviceName} (${state.quantity}x — Rs. ${state.totalPrice}):`;
+
+    await this.sendInteractiveList(
+      client,
+      headerText,
+      bodyText,
+      'Pick a Time',
+      [{ title: `Openings (${formattedDate})`, rows: slotRows }],
+    );
+
+    return true;
   }
 
   private async showBookingSummaryAndConfirm(
@@ -799,27 +1144,33 @@ export class WhatsAppService {
     state.step = 'AWAITING_CONFIRMATION';
     await this.setConversationState(client, state);
 
-    const dateStr = new Date(state.selectedSlot!).toLocaleDateString('en-US', {
+    const admin = state.adminId
+      ? await this.adminService.getAdminProfile(state.adminId).catch(() => null)
+      : null;
+    const timeZone = (admin as any)?.timezone || 'Asia/Kathmandu';
+
+    const slotDate = new Date(state.selectedSlot!);
+    const dateStr = formatInTimeZone(slotDate, timeZone, {
       weekday: 'short',
       month: 'short',
       day: 'numeric',
       year: 'numeric',
     });
 
-    const startLocal = new Date(state.selectedSlot!).toLocaleTimeString('en-US', {
+    const startLocal = formatInTimeZone(slotDate, timeZone, {
       hour: '2-digit',
       minute: '2-digit',
     });
 
     const summaryText =
       `📋 *Please confirm your consultation details:*\n\n` +
-      `📌 *Service:* ${state.serviceName || 'Consultation'}\n` +
-      `🔢 *Quantity:* ${state.quantity || 1}\n` +
-      `💰 *Total Fee:* Rs. ${state.totalPrice || 500}\n` +
-      `📅 *Date:* ${dateStr}\n` +
-      `⏰ *Time:* ${startLocal}\n` +
-      `👤 *Client Name:* ${state.clientName || 'Client'}\n` +
-      `📍 *Address:* ${state.address || 'Not provided'}\n\n` +
+      `*Service:* ${state.serviceName || 'Consultation'}\n` +
+      `*Quantity:* ${state.quantity || 1}\n` +
+      `*Total Fee:* Rs. ${state.totalPrice || 500}\n` +
+      `*Date:* ${dateStr}\n` +
+      `*Time:* ${startLocal}\n` +
+      `*Client Name:* ${state.clientName || 'Client'}\n` +
+       `*Address:* ${state.address || 'Not provided'}\n\n` +
       `Tap *Confirm Booking* below to lock in your appointment!`;
 
     await this.sendInteractiveButtons(
@@ -828,6 +1179,7 @@ export class WhatsAppService {
       summaryText,
       [
         { id: 'btn_confirm', title: '✅ Confirm Booking' },
+        { id: 'btn_edit_details', title: '✏️ Update Details' },
         { id: 'btn_cancel', title: '❌ Cancel' },
       ],
       'Astrologer Booking System',
@@ -858,21 +1210,27 @@ export class WhatsAppService {
         notes: `Service: ${state.serviceName} | Quantity: ${state.quantity}x | Fee: Rs. ${state.totalPrice} | Address: ${address || 'Not provided'}`,
       });
 
-      const dateStr = new Date(booking.scheduledStart).toLocaleDateString('en-US', {
+      const admin = state.adminId
+        ? await this.adminService.getAdminProfile(state.adminId).catch(() => null)
+        : null;
+      const timeZone = (admin as any)?.timezone || 'Asia/Kathmandu';
+
+      const slotDate = new Date(booking.scheduledStart);
+      const dateStr = formatInTimeZone(slotDate, timeZone, {
         weekday: 'short',
         month: 'short',
         day: 'numeric',
         year: 'numeric',
       });
 
-      const startLocal = new Date(booking.scheduledStart).toLocaleTimeString('en-US', {
+      const startLocal = formatInTimeZone(slotDate, timeZone, {
         hour: '2-digit',
         minute: '2-digit',
       });
 
       await this.sendTextMessage(
         client,
-        `🎉 *Booking Confirmed!* 🎉\n\n` +
+        ` *Booking Confirmed!* \n\n` +
           `📌 *Service:* ${state.serviceName} (${state.quantity}x)\n` +
           `💰 *Total Fee:* Rs. ${state.totalPrice}\n` +
           `📅 *Date:* ${dateStr}\n` +
@@ -884,12 +1242,21 @@ export class WhatsAppService {
       );
       await this.clearConversationState(client);
     } catch (err: any) {
-      // Slot overlap or constraint error
+      this.logger.warn(`Booking execution conflict/error: ${err.message}`);
       await this.sendTextMessage(
         client,
-        '⚠️ *Slot Unavailable*: That time slot was just taken by another client. Please reply "book" to pick another available slot.',
+        '⚠️ *Slot Unavailable*: That time slot was just taken by another client while confirming.',
       );
-      await this.clearConversationState(client);
+      // Keep client name and address in state, switch back to AWAITING_SLOT
+      state.selectedSlot = undefined;
+      state.step = 'AWAITING_SLOT';
+      await this.setConversationState(client, state);
+      await this.presentAvailableSlots(
+        client,
+        state,
+        'Choose Another Slot',
+        'Please select another available time slot below to complete your booking:',
+      );
     }
   }
 }
